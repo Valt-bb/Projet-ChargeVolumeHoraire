@@ -61,6 +61,18 @@ DEFAULT_DATASET_PATH = ROOT_DIR / "data" / "crash_test_questions.json"
 if not DEFAULT_DATASET_PATH.exists() and Path("data/crash_test_questions.json").exists():
     DEFAULT_DATASET_PATH = Path("data/crash_test_questions.json")
 
+ROUTING_ALIAS_MAP: dict[str, list[str]] = {
+    "advisor": ["advisor", "career_advisor", "orientation_advisor"],
+    "career_advisor": ["advisor", "career_advisor"],
+    "auditor": ["auditor", "consistency_auditor", "prereq_auditor"],
+    "consistency_auditor": ["auditor", "consistency_auditor"],
+    "exam_planner": ["exam_planner", "revision_planner"],
+    "internship_matcher": ["internship_matcher", "career_matcher"],
+    "quiz_gen": ["quiz_gen", "quiz_prep", "quiz_generator"],
+    "workload_estimator": ["workload_estimator", "charge_estimator"],
+    "supervisor": ["supervisor", "guardrail_security", "guardrail"],
+}
+
 
 class MockMultiAgentRunner:
     """
@@ -247,7 +259,7 @@ class MockMultiAgentRunner:
     def __init__(self, registered_agent_names: list[str]):
         self.registered_agent_names = set(registered_agent_names)
 
-    def run_query(self, question: dict[str, Any]) -> tuple[str, str, float]:
+    def run_query(self, question: dict[str, Any]) -> tuple[str, str, float, list[str]]:
         start = time.perf_counter()
         time.sleep(0.04)  # Légère simulation de latence
         q_id = question["id"]
@@ -256,18 +268,24 @@ class MockMultiAgentRunner:
         if not mock_data:
             routed = "syllabus_explorer"
             content = f"[Agent {routed}] Traitement générique de la requête : {question['query']}"
+            executed_trace = ["supervisor", routed, "supervisor"]
         else:
             primary_agent = mock_data["routed_agent"]
-            # Si l'agent cible n'est pas encore enregistré par les étudiants, repli sur syllabus_explorer
-            if primary_agent in self.registered_agent_names or primary_agent == "supervisor":
+            valid_targets = {primary_agent, *ROUTING_ALIAS_MAP.get(primary_agent, [])}
+            matching_registered = [n for n in self.registered_agent_names if n.lower() in valid_targets]
+
+            if matching_registered:
+                routed = matching_registered[0]
+            elif primary_agent in self.registered_agent_names or primary_agent == "supervisor":
                 routed = primary_agent
             else:
                 routed = "syllabus_explorer"
 
             content = mock_data["content"]
+            executed_trace = ["supervisor"] if routed == "supervisor" else ["supervisor", routed, "supervisor"]
 
         elapsed = time.perf_counter() - start
-        return routed, content, elapsed
+        return routed, content, elapsed, executed_trace
 
 
 def evaluate_question(
@@ -275,10 +293,11 @@ def evaluate_question(
     routed_agent: str,
     response_text: str,
     registered_agents: list[str],
+    executed_nodes: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Évalue une question selon les critères :
-    1. Routage Superviseur (agent choisi vs agent attendu / plugins disponibles)
+    1. Routage Superviseur (fondé en priorité sur la trace d'exécution LangGraph)
     2. Présence des mots-clés attendus (ou détection de cas piège / guardrail)
     """
     is_adversarial = question.get("is_adversarial", False) or question.get("category") == "adversarial"
@@ -289,26 +308,26 @@ def evaluate_question(
     routed_lower = routed_agent.lower()
     expected_agent_lower = expected_agent.lower()
 
-    # --- 1. Évaluation du Routage ---
-    alias_map = {
-        "advisor": ["advisor", "career_advisor", "orientation_advisor"],
-        "career_advisor": ["advisor", "career_advisor"],
-        "auditor": ["auditor", "consistency_auditor", "prereq_auditor"],
-        "consistency_auditor": ["auditor", "consistency_auditor"],
-        "exam_planner": ["exam_planner", "revision_planner"],
-        "internship_matcher": ["internship_matcher", "career_matcher"],
-        "quiz_gen": ["quiz_gen", "quiz_prep", "quiz_generator"],
-        "workload_estimator": ["workload_estimator", "charge_estimator"],
-        "supervisor": ["supervisor", "guardrail_security", "guardrail"],
-    }
+    # --- 1. Évaluation du Routage via la Trace LangGraph ---
     routing_match = False
-    valid_targets = [expected_agent_lower] + alias_map.get(expected_agent_lower, [])
-    if routed_lower in valid_targets:
+    valid_targets = {expected_agent_lower, *ROUTING_ALIAS_MAP.get(expected_agent_lower, [])}
+
+    trace = executed_nodes or []
+    called_agents = [
+        node for node in trace
+        if node.lower() not in ("supervisor", "guardrail_security", "guardrail", "__start__", "__end__")
+    ]
+
+    # Détecter si l'agent attendu (ou son alias) a été appelé dans la trace ou routé
+    agents_to_check = {routed_lower}
+    agents_to_check.update(a.lower() for a in called_agents)
+
+    if any(agent in valid_targets for agent in agents_to_check):
         routing_match = True
     elif expected_agent_lower not in [name.lower() for name in registered_agents]:
         # Si l'agent spécialisé n'est pas encore présent (ex: pré-séance 7),
         # syllabus_explorer ou supervisor est un agent de repli valide
-        if routed_lower in ["syllabus_explorer", "supervisor"]:
+        if routed_lower in ["syllabus_explorer", "supervisor"] or not called_agents:
             routing_match = True
 
     routing_score = 1.0 if routing_match else 0.0
@@ -394,6 +413,8 @@ def evaluate_question(
         "query": question["query"],
         "expected_agent": expected_agent,
         "routed_agent": routed_agent,
+        "called_agents": called_agents,
+        "execution_trace": trace,
         "routing_match": routing_match,
         "expected_keywords": expected_keywords,
         "matched_keywords": matched_keywords,
@@ -496,7 +517,7 @@ def run_crash_test(
             progress_bar.update(task, description=f"[cyan]Test {q_id} en cours...")
 
             if mock_mode or graph_app is None:
-                routed_agent, response_content, elapsed = mock_runner.run_query(q)
+                routed_agent, response_content, elapsed, executed_nodes = mock_runner.run_query(q)
             else:
                 start_time = time.perf_counter()
                 initial_state: AgentState = {
@@ -505,32 +526,77 @@ def run_crash_test(
                     "current_agent": None,
                     "context_data": {},
                 }
+                executed_nodes: list[str] = []
+                final_state: dict[str, Any] = {}
                 try:
-                    output_state = graph_app.invoke(initial_state, config={"recursion_limit": 10})
+                    # Traçage LangGraph natif des nœuds exécutés via streaming (updates + values)
+                    for mode, payload in graph_app.stream(
+                        initial_state,
+                        config={"recursion_limit": 10},
+                        stream_mode=["updates", "values"],
+                    ):
+                        if mode == "updates" and isinstance(payload, dict):
+                            for node_name in payload.keys():
+                                executed_nodes.append(str(node_name))
+                        elif mode == "values" and isinstance(payload, dict):
+                            final_state = payload
+
                     elapsed = time.perf_counter() - start_time
-                    messages: list[BaseMessage] = list(output_state.get("messages", []))
+                    messages: list[BaseMessage] = list(final_state.get("messages", []))
                     response_content = (
                         str(messages[-1].content) if messages else "Aucune réponse générée."
                     )
-                    routed_agent = str(output_state.get("current_agent") or "supervisor")
-                    # Extraction du préfixe [Agent xxx] si présent dans le texte
-                    if "[Agent " in response_content:
-                        tag = response_content.split("[Agent ")[1].split("]")[0]
-                        routed_agent = tag.strip()
+
+                    # Identification des sous-agents exécutés dans la trace LangGraph
+                    called_agents = [
+                        node for node in executed_nodes
+                        if node.lower() not in (
+                            "supervisor",
+                            "guardrail_security",
+                            "guardrail",
+                            "__start__",
+                            "__end__",
+                        )
+                    ]
+
+                    if called_agents:
+                        # Si l'agent attendu ou son alias a été exécuté, on le retient en priorité
+                        expected_clean = q.get("expected_agent", "").lower().strip()
+                        valid_for_expected = {expected_clean, *ROUTING_ALIAS_MAP.get(expected_clean, [])}
+                        matching_called = [a for a in called_agents if a.lower() in valid_for_expected]
+                        routed_agent = matching_called[0] if matching_called else called_agents[0]
+                    else:
+                        # Si aucun agent spécialisé n'a été appelé, le superviseur (ou guardrail) a géré la requête
+                        routed_agent = str(final_state.get("current_agent") or "supervisor")
+
+                    # Repli défensif secondaire : si aucun sous-agent n'est dans la trace mais qu'un tag explicite existe
+                    if routed_agent == "supervisor" and "[Agent " in response_content:
+                        tag = response_content.split("[Agent ")[1].split("]")[0].strip()
+                        if tag:
+                            routed_agent = tag
                 except Exception as err:
                     elapsed = time.perf_counter() - start_time
                     routed_agent = "error"
                     response_content = f"Exception d'exécution : {err}"
+                    executed_nodes = ["error"]
 
             latencies.append(elapsed)
-            eval_res = evaluate_question(q, routed_agent, response_content, plugin_names)
+            eval_res = evaluate_question(
+                q,
+                routed_agent,
+                response_content,
+                plugin_names,
+                executed_nodes=executed_nodes,
+            )
             eval_res["latency"] = elapsed
+            eval_res["response"] = response_content
             eval_res["response_preview"] = response_content
             results.append(eval_res)
 
             progress_bar.advance(task)
             status_color = "green" if eval_res["status"] == "PASS" else ("yellow" if eval_res["status"] == "WARN" else "red")
-            console.print(f"  [{status_color}]• [{q_id}] {elapsed:.1f}s -> Routé: {routed_agent} | Score: {eval_res['final_score']:.2f} ({eval_res['status']})[/]")
+            trace_preview = " -> ".join(executed_nodes) if executed_nodes else routed_agent
+            console.print(f"  [{status_color}]• [{q_id}] {elapsed:.1f}s -> Nœuds: {trace_preview} | Score: {eval_res['final_score']:.2f} ({eval_res['status']})[/]")
             sys.stdout.flush()
 
     # 4. Affichage du Tableau Récapitulatif
@@ -645,8 +711,9 @@ def run_crash_test(
         console.print("\n[bold cyan]🔍 Détail Verbeux des Réponses :[/bold cyan]\n")
         for r in results:
             console.print(f"[bold yellow][{r['id']}] {r['query']}[/bold yellow]")
+            trace_str = " -> ".join(r.get("execution_trace", [])) or r["routed_agent"]
             console.print(
-                f"[dim]Routé vers : {r['routed_agent']} | Score : {r['final_score']:.2f}[/dim]"
+                f"[dim]Routé vers : {r['routed_agent']} | Trace LangGraph : {trace_str} | Score : {r['final_score']:.2f}[/dim]"
             )
             console.print(Panel(r["response_preview"], border_style="dim"))
             console.print()
@@ -695,6 +762,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--export",
+        "--report",
         type=Path,
         default=None,
         help="Chemin pour exporter le compte-rendu d'évaluation au format JSON.",
