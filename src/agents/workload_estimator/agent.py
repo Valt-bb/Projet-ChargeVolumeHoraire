@@ -137,7 +137,7 @@ class WorkloadEstimatorPlugin(BaseAgentPlugin):
                 response_text = format_domain_response(tool_results)
 
             # Préfixage obligatoire avec l'identifiant pour la traçabilité
-            final_message = AIMessage(content=f"[{self.name}] {response_text}")
+            final_message = AIMessage(content=f"[Agent{self.name}]\n{response_text}")
 
             return {
                 "messages": [final_message],
